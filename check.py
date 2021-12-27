@@ -1,8 +1,34 @@
+import itertools
 import sys
+from dataclasses import dataclass
 from typing import List
 
 import cv2
 import numpy as np
+
+
+@dataclass
+class Rect:
+    left: int = 0
+    top: int = 0
+    width: int = 0
+    height: int = 0
+
+    @property
+    def right(self) -> int:
+        # inclusive
+        return self.left + self.width - 1
+
+    @property
+    def bottom(self) -> int:
+        # inclusive
+        return self.top + self.height - 1
+
+    def contains(self, x, y) -> bool:
+        return self.left <= x <= self.right and self.top <= y <= self.bottom
+
+    def inner(self, size: int) -> 'Rect':
+        return Rect(self.left+size, self.top+size, self.width-size*2, self.height-size*2)
 
 
 class QRCodeExtractor:
@@ -20,6 +46,8 @@ class QRCodeExtractor:
 
         self.error_collect_level = 0
         self.mask_pattern = 0
+
+        self.read_format()
 
     def extract(self, x, y) -> int:
         bgr = (self.img[self.tl_y + y * self.scale][self.tl_x + x * self.scale])
@@ -43,57 +71,62 @@ class QRCodeExtractor:
             raise Exception(f'({x}, {y}) is not black')
         return True
 
-    def validate_finder_pattern(self) -> bool:
-        for x in range(7):
-            # 左上、上
-            self.assert_black(x, 0)
-            # 左上、下
-            self.assert_black(x, 6)
-            # 右上、上
-            self.assert_black(self.size - x - 1, 0)
-            # 右上、下
-            self.assert_black(self.size - x - 1, 6)
-            # 左下、上
-            self.assert_black(x, self.size - 1 - 6)
-            # 左下、下
-            self.assert_black(x, self.size - 1)
+    @property
+    def finder_rects(self) -> List[Rect]:
+        return [
+            Rect(0, 0, 7, 7),
+            Rect(0, self.size - 7, 7, 7),
+            Rect(self.size - 7, 0, 7, 7)
+        ]
 
-        for y in range(7):
-            # 左上、左
-            self.assert_black(0, y)
-            # 左上、右
-            self.assert_black(6, y)
-            # 左上、左
-            self.assert_black(self.size - 1 - 6, y)
-            # 左上、右
-            self.assert_black(self.size - 1, y)
-            # 左下、左
-            self.assert_black(0, self.size - y - 1)
-            # 左下、右
-            self.assert_black(6, self.size - y - 1)
+    def validate_finder_pattern(self) -> bool:
+        rects = self.finder_rects
+
+        for x, y in itertools.product(range(self.size), range(self.size)):
+            for rect in rects:
+                inner_rect = rect.inner(1)
+                more_inner_rect = inner_rect.inner(1)
+
+                if rect.contains(x, y):
+                    if inner_rect.contains(x, y) and not more_inner_rect.contains(x, y):
+                        self.assert_white(x, y)
+                    else:
+                        self.assert_black(x, y)
+                    break
 
         return True
 
     def validate_quiet_zone(self) -> bool:
-        for x in range(8):
-            self.assert_white(x, 7)
-            self.assert_white(x, self.size - 1 - 7)
-            self.assert_white(self.size - x - 1, 7)
-
-        for y in range(8):
-            self.assert_white(7, y)
-            self.assert_white(7, self.size - 1 - y)
-            self.assert_white(self.size - 1 - 7, y)
+        for x in range(self.size):
+            for y in range(self.size):
+                if self.is_quiet_zone(x, y):
+                    self.assert_white(x, y)
 
         return True
 
+    def validate_timing_pattern(self) -> bool:
+        timing_pattern = []
+        for x in range(self.size):
+            for y in range(self.size):
+                if self.is_timing_pattern(x, y):
+                    timing_pattern.append((x, y))
+
+        for i in range(len(timing_pattern) // 2):
+            if i % 2 == 0:
+                self.assert_black(*timing_pattern[i])
+                self.assert_black(*timing_pattern[i + len(timing_pattern) // 2])
+            else:
+                self.assert_white(*timing_pattern[i])
+                self.assert_white(*timing_pattern[i + len(timing_pattern) // 2])
+        return True
+
     def is_finder_pattern(self, x, y) -> bool:
-        if x < 7 and y < 7:  # 左上
-            return True
-        elif x < 7 and y >= self.size - 7:  # 左下
-            return True
-        elif x >= self.size - 7 and y < 7:  # 右上
-            return True
+        rects = self.finder_rects
+
+        for rect in rects:
+            if rect.contains(x, y):
+                return True
+
         return False
 
     def is_quiet_zone(self, x, y):
@@ -177,6 +210,7 @@ class QRCodeExtractor:
         return False
 
     def read_contents(self):
+        
         bits = [
             self.extract_with_mask(self.size - 1, self.size - 1),
             self.extract_with_mask(self.size - 2, self.size - 1),
@@ -254,18 +288,20 @@ def check(img, qr_type):
             qr = QRCodeExtractor(img, point, qr_size)
 
             print("Check Finder Pattern")
-            print(qr.validate_finder_pattern())
+            qr.validate_finder_pattern()
 
             qr.print_finder_pattern()
 
             print("Check Quiet")
-            print(qr.validate_quiet_zone())
+            qr.validate_quiet_zone()
 
             qr.print_quiet_zone()
+
+            print("Check Timing Pattern")
+            qr.validate_timing_pattern()
+
             qr.print_timing_pattern()
 
-            print("Data Format")
-            print(qr.read_format())
 
             print("Data Mode")
             print(qr.read_data_mode())
