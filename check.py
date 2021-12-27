@@ -107,11 +107,9 @@ class QRCodeExtractor:
         return False
 
     def is_timing_pattern(self, x, y):
-        if x < 8 and y == 7 or x == 7 and y < 8: # 左上
+        if x == 6 and 7 < y < self.size - 8:
             return True
-        elif x < 8 and y == self.size - 8 or x == 7 and y > self.size - 8:  # 左下
-            return True
-        elif x > self.size - 8 and y == 7 or x == self.size - 8 and y < 8:  # 右上
+        if 7 < x < self.size - 8 and y == 6:
             return True
 
         return False
@@ -126,14 +124,16 @@ class QRCodeExtractor:
     def read_format(self):
         bits = []
         for x in range(8):
-            if x == 6:
+            y = 8
+            if self.is_timing_pattern(x, y):
                 continue
-            bits.append(self.extract(x, 8))
+            bits.append(self.extract(x, y))
 
         for y in range(8, -1, -1):
-            if y == 6:
+            x = 8
+            if self.is_timing_pattern(x, y):
                 continue
-            bits.append(self.extract(8, y))
+            bits.append(self.extract(x, y))
 
         bits = self.xor(bits, self.format_mask)
 
@@ -234,6 +234,9 @@ class QRCodeExtractor:
     def print_quiet_zone(self):
         self.print_pattern(self.is_quiet_zone)
 
+    def print_timing_pattern(self):
+        self.print_pattern(self.is_timing_pattern)
+
 
 def check(img, qr_type):
     # qr_type ごとのサイズ
@@ -259,6 +262,7 @@ def check(img, qr_type):
             print(qr.validate_quiet_zone())
 
             qr.print_quiet_zone()
+            qr.print_timing_pattern()
 
             print("Data Format")
             print(qr.read_format())
