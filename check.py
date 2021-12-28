@@ -1,7 +1,7 @@
 import itertools
 import sys
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -34,6 +34,13 @@ class Rect:
 class QRCodeExtractor:
     format_mask = [1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0]
 
+    size_bits = {
+        0b0001: 10,  # number
+        0b0010: 9,  # alphanumeric
+        0b0100: 8,  # bytes
+        0b1000: 8,  # Kanji
+    }
+
     def __init__(self, img, rect, size):
         self.img = img
         self.tl_x = rect[0][1]
@@ -42,12 +49,15 @@ class QRCodeExtractor:
         self.br_y = rect[2][0]
         self.size = size
         self.scale = (self.br_x - self.tl_x + 1) // size
-        print(self.scale)
+        self.contents = []
 
         self.error_collect_level = 0
         self.mask_pattern = 0
+        self.data_mode = 0
 
+    def read_all(self):
         self.read_format()
+        self.read_contents()
 
     def extract(self, x, y) -> int:
         bgr = (self.img[self.tl_y + y * self.scale][self.tl_x + x * self.scale])
@@ -79,6 +89,28 @@ class QRCodeExtractor:
             Rect(self.size - 7, 0, 7, 7)
         ]
 
+    @property
+    def format_points(self) -> (List[Tuple[int, int]], List[Tuple[int, int]]):
+        format_points_1 = []
+        for x in range(8):
+            format_points_1.append((x, 8))
+
+        for y in range(8, -1, -1):
+            format_points_1.append((8, y))
+
+        format_points_2 = []
+
+        for y in range(self.size - 1, self.size - 1 - 7, -1):
+            format_points_2.append((8, y))
+
+        for x in range(self.size - 1 - 7, self.size):
+            format_points_2.append((x, 8))
+
+        format_points_1 = list(filter(lambda p: not self.is_timing_pattern(p[0], p[1]), format_points_1))
+        format_points_2 = list(filter(lambda p: not self.is_timing_pattern(p[0], p[1]), format_points_2))
+
+        return format_points_1, format_points_2
+
     def validate_finder_pattern(self) -> bool:
         rects = self.finder_rects
 
@@ -104,6 +136,13 @@ class QRCodeExtractor:
 
         return True
 
+    def validate_format_zone(self) -> bool:
+        format_points = self.format_points
+        for i in range(len(format_points[0])):
+            if self.extract(*format_points[0][i]) != self.extract(*format_points[1][i]):
+                raise Exception(f'Format point is not same. ({format_points[0][i]} != {format_points[1][i]}')
+        return True
+
     def validate_timing_pattern(self) -> bool:
         timing_pattern = []
         for x in range(self.size):
@@ -120,6 +159,9 @@ class QRCodeExtractor:
                 self.assert_white(*timing_pattern[i + len(timing_pattern) // 2])
         return True
 
+    def is_contents_zone(self, x, y) -> bool:
+        return not (self.is_finder_pattern(x, y) or self.is_quiet_zone(x, y) or self.is_format_zone(x, y) or self.is_timing_pattern(x, y))
+
     def is_finder_pattern(self, x, y) -> bool:
         rects = self.finder_rects
 
@@ -130,12 +172,19 @@ class QRCodeExtractor:
         return False
 
     def is_quiet_zone(self, x, y):
-        if x < 8 and y == 7 or x == 7 and y < 8: # 左上
+        if x < 8 and y == 7 or x == 7 and y < 8:  # 左上
             return True
         elif x < 8 and y == self.size - 8 or x == 7 and y > self.size - 8:  # 左下
             return True
         elif x > self.size - 8 and y == 7 or x == self.size - 8 and y < 8:  # 右上
             return True
+
+        return False
+
+    def is_format_zone(self, x, y):
+        for format_points in self.format_points:
+            if (x, y) in format_points:
+                return True
 
         return False
 
@@ -147,7 +196,8 @@ class QRCodeExtractor:
 
         return False
 
-    def xor(self, bits, mask) -> List[int]:
+    @staticmethod
+    def xor(bits, mask) -> List[int]:
         result = []
         for b, m in zip(bits, mask):
             result.append(b ^ m)
@@ -155,17 +205,11 @@ class QRCodeExtractor:
         return result
 
     def read_format(self):
-        bits = []
-        for x in range(8):
-            y = 8
-            if self.is_timing_pattern(x, y):
-                continue
-            bits.append(self.extract(x, y))
+        format_points = self.format_points
 
-        for y in range(8, -1, -1):
-            x = 8
-            if self.is_timing_pattern(x, y):
-                continue
+        bits = []
+
+        for x, y in format_points[0]:
             bits.append(self.extract(x, y))
 
         bits = self.xor(bits, self.format_mask)
@@ -184,7 +228,7 @@ class QRCodeExtractor:
         self.error_collect_level = error_correct_level
 
         mask_pattern = bits[2] * 4 + bits[3] * 2 + bits[4]
-        print(f'Mask pattern {mask_pattern}')
+        print(f'Mask pattern {bin(mask_pattern)}')
         self.mask_pattern = mask_pattern
 
     def is_masked(self, x, y) -> bool:
@@ -209,58 +253,110 @@ class QRCodeExtractor:
 
         return False
 
+    def get_next_read_vector_x(self, x, y):
+        if x <= 6:  # left timing pattern
+            if x == 6:
+                if y == 0:
+                    return -1
+                else:
+                    return 0
+            x = x + 1
+
+        if x % 2 == 0:
+            return -1
+        else:
+            if y == 0 and x % 4 != 1 or y == self.size - 1 and x % 4 == 1:
+                return -1
+            return 1
+
+    def get_next_read_vector_y(self, x, y):
+        if x <= 6:  # left timing pattern
+            if x == 6:
+                return 0
+            x = x + 1
+
+        if y == 0:
+            if x % 4 != 1:
+                return 0
+            else:
+                return 1
+        elif y == self.size - 1:
+            if x % 4 != 3:
+                return 0
+            else:
+                return -1
+        elif x % 2 == 0:
+            return 0
+        elif x % 4 in [1, 2]:
+            return 1
+        else:
+            return -1
+
     def read_contents(self):
-        
-        bits = [
-            self.extract_with_mask(self.size - 1, self.size - 1),
-            self.extract_with_mask(self.size - 2, self.size - 1),
-            self.extract_with_mask(self.size - 1, self.size - 2),
-            self.extract_with_mask(self.size - 2, self.size - 2),
-            # self.extract(self.size - 1, self.size - 1),
-            # self.extract(self.size - 2, self.size - 1),
-            # self.extract(self.size - 1, self.size - 2),
-            # self.extract(self.size - 2, self.size - 2),
-        ]
+        x = self.size - 1
+        y = self.size - 1
+        contents = []
+        while x >= 0 and y >= 0:
+            if self.is_contents_zone(x, y):
+                contents.append(self.extract_with_mask(x, y))
 
-    def read_data_mode(self):
-        bits = [
-            self.extract_with_mask(self.size - 1, self.size - 1),
-            self.extract_with_mask(self.size - 2, self.size - 1),
-            self.extract_with_mask(self.size - 1, self.size - 2),
-            self.extract_with_mask(self.size - 2, self.size - 2),
-            # self.extract(self.size - 1, self.size - 1),
-            # self.extract(self.size - 2, self.size - 1),
-            # self.extract(self.size - 1, self.size - 2),
-            # self.extract(self.size - 2, self.size - 2),
-        ]
+            vector_x = self.get_next_read_vector_x(x, y)
+            vector_y = self.get_next_read_vector_y(x, y)
 
-        print(bits)
+            x += vector_x
+            y += vector_y
 
-    def read_data_size(self):
-        bits = [
-            self.extract_with_mask(self.size - 1, self.size - 3),
-            self.extract_with_mask(self.size - 2, self.size - 3),
-            self.extract_with_mask(self.size - 1, self.size - 4),
-            self.extract_with_mask(self.size - 2, self.size - 4),
-            self.extract_with_mask(self.size - 1, self.size - 5),
-            self.extract_with_mask(self.size - 2, self.size - 5),
-            self.extract_with_mask(self.size - 1, self.size - 6),
-            self.extract_with_mask(self.size - 2, self.size - 6),
-            # self.extract(self.size - 1, self.size - 1),
-            # self.extract(self.size - 2, self.size - 1),
-            # self.extract(self.size - 1, self.size - 2),
-            # self.extract(self.size - 2, self.size - 2),
-        ]
+        self.contents = contents
+        print(f'Contents {contents}')
 
-        print(bits)
+        data_pointer = self.contents.copy()
+        # read data mode
+        data_mode = 0
+        for i in range(4):
+            data_mode = data_mode << 1
+            data_mode += data_pointer.pop(0)
+
+        print(f'Data Mode {bin(data_mode)}')
+        # read data size
+        if data_mode not in self.size_bits:
+            print(f'Unknown data type: {bin(data_mode)}')
+            data_mode = 0b0100
+        data_size = 0
+        for i in range(self.size_bits[data_mode]):
+            data_size = data_size << 1
+            data_size += data_pointer.pop(0)
+
+        print(f'Data Size {data_size}')
+
+        # 8 bits only. TODO: Other data type
+        data_bytes = []
+        for i in range(data_size):
+            byte = 0
+            for j in range(8):
+                byte = byte << 1
+                byte += data_pointer.pop(0)
+
+            data_bytes.append(byte)
+
+        print(f'Actual Data {list(map(lambda b: hex(b), data_bytes))}')
+
+        # termination
+        termination = []
+        for i in range(4):
+            termination.append(data_pointer.pop(0))
+
+        print(f'Termination {termination}')
 
     def print_pattern(self, pattern_function):
         pattern = ''
         for y in range(self.size):
             for x in range(self.size):
-                pattern += 'o' if pattern_function(x, y) else '.'
+                pattern += 'o ' if pattern_function(x, y) else '. '
             pattern += '\n'
         print(pattern)
+
+    def print_raw_pattern(self):
+        self.print_pattern(lambda x, y: self.extract(x, y) > 0)
 
     def print_finder_pattern(self):
         self.print_pattern(self.is_finder_pattern)
@@ -268,8 +364,49 @@ class QRCodeExtractor:
     def print_quiet_zone(self):
         self.print_pattern(self.is_quiet_zone)
 
+    def print_format_zone(self):
+        self.print_pattern(self.is_format_zone)
+
     def print_timing_pattern(self):
         self.print_pattern(self.is_timing_pattern)
+
+    def print_mask_pattern(self):
+        self.print_pattern(self.is_masked)
+
+    def print_read_vector(self):
+        pattern = ''
+        for y in range(self.size):
+            for x in range(self.size):
+                if self.is_finder_pattern(x, y) or self.is_quiet_zone(x, y) or self.is_format_zone(x, y) or self.is_timing_pattern(x, y):
+                    # pattern += '.'
+                    # continue
+                    pass
+
+                vector_x = self.get_next_read_vector_x(x, y)
+                vector_y = self.get_next_read_vector_y(x, y)
+                if vector_y > 0:
+                    if vector_x > 0:
+                        pattern += '┘'
+                    elif vector_x < 0:
+                        pattern += '└'
+                    else:
+                        pattern += 'v'
+                elif vector_y < 0:
+                    if vector_x > 0:
+                        pattern += '┐'
+                    elif vector_x < 0:
+                        pattern += '┌'
+                    else:
+                        pattern += '^'
+                else:
+                    if vector_x > 0:
+                        pattern += '>'
+                    elif vector_x < 0:
+                        pattern += '<'
+                    else:
+                        pattern += '.'
+            pattern += '\n'
+        print(pattern)
 
 
 def check(img, qr_type):
@@ -280,39 +417,42 @@ def check(img, qr_type):
 
     retval, points = qrd.detect(img)
     if retval:
-        points = points.astype(np.int)
+        points = points.astype(int)
 
         for point in points:
             print(point)
 
             qr = QRCodeExtractor(img, point, qr_size)
 
-            print("Check Finder Pattern")
-            qr.validate_finder_pattern()
+            # print("Raw Pattern")
+            # qr.print_raw_pattern()
+            #
+            # print("Check Finder Pattern")
+            # qr.validate_finder_pattern()
+            # qr.print_finder_pattern()
+            #
+            # print("Check Quiet")
+            # qr.validate_quiet_zone()
+            # qr.print_quiet_zone()
+            #
+            # print("Check Format Zone")
+            # qr.validate_format_zone()
+            # qr.print_format_zone()
+            #
+            # print("Check Timing Pattern")
+            # qr.validate_timing_pattern()
+            # qr.print_timing_pattern()
+            #
+            # print("Read Vector")
+            # print(qr.print_read_vector())
+            qr.read_all()
 
-            qr.print_finder_pattern()
-
-            print("Check Quiet")
-            qr.validate_quiet_zone()
-
-            qr.print_quiet_zone()
-
-            print("Check Timing Pattern")
-            qr.validate_timing_pattern()
-
-            qr.print_timing_pattern()
-
-
-            print("Data Mode")
-            print(qr.read_data_mode())
-
-            print("Data Size")
-            print(qr.read_data_size())
+            # qr.print_mask_pattern()
 
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
         print(f'Usage: python {sys.argv[0]} image_file_path qr_type')
         exit(1)
-    img = cv2.imread(sys.argv[1], cv2.IMREAD_COLOR)
-    check(img, int(sys.argv[2]))
+    image = cv2.imread(sys.argv[1], cv2.IMREAD_COLOR)
+    check(image, int(sys.argv[2]))
